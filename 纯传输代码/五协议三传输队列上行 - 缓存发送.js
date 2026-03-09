@@ -529,40 +529,122 @@ const handleWebSocketConn = async (webSocket, request) => {
     webSocket.addEventListener("message", event => {processingChain = processingChain.then(() => process(event.data).catch(close))});
 };
 const xhttpResponseHeaders = {'Content-Type': 'application/octet-stream', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
-const handleXhttp = async (request) => {
+const makeProtobufGrpcFrame = (data) => {
+    data = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const len = data.byteLength;
+    let varintLen = 0;
+    let tempLen = len;
+    do {
+        tempLen >>>= 7;
+        varintLen++;
+    } while (tempLen > 0);
+    const pbHeaderLen = 1 + varintLen;
+    const totalPayloadLen = pbHeaderLen + len;
+    const grpcFrame = new Uint8Array(5 + totalPayloadLen);
+    grpcFrame[0] = 0;
+    grpcFrame[1] = (totalPayloadLen >>> 24) & 0xFF;
+    grpcFrame[2] = (totalPayloadLen >>> 16) & 0xFF;
+    grpcFrame[3] = (totalPayloadLen >>> 8) & 0xFF;
+    grpcFrame[4] = totalPayloadLen & 0xFF;
+    grpcFrame[5] = 0x0A;
+    let offset = 6;
+    tempLen = len;
+    while (tempLen > 127) {
+        grpcFrame[offset++] = (tempLen & 0x7F) | 0x80;
+        tempLen >>>= 7;
+    }
+    grpcFrame[offset++] = tempLen;
+    grpcFrame.set(data, offset);
+    return grpcFrame;
+};
+const stripProtobufHeader = (data) => {
+    if (data[0] !== 0x0A) return data;
+    let p = 1;
+    while (data[p++] & 0x80) ;
+    return data.slice(p);
+};
+const handlePost = async (request) => {
     const _maxChunkLen = maxChunkLen;
     const reader = request.body.getReader({mode: 'byob'});
     const state = {socks5State: 0, tcpWriter: null, tcpSocket: null};
-    let sessionBuffer = new ArrayBuffer(_maxChunkLen), used = 0;
+    let buffer = new Uint8Array(0);
+    let sessionBuffer = new ArrayBuffer(_maxChunkLen);
+    while (buffer.length === 0 || (buffer[0] === 0 && buffer.length < 6)) {
+        const {value, done} = await reader.read(new Uint8Array(sessionBuffer, 0, _maxChunkLen));
+        if (done) break;
+        const chunk = new Uint8Array(value);
+        const newBuf = new Uint8Array(buffer.length + chunk.length);
+        newBuf.set(buffer);
+        newBuf.set(chunk, buffer.length);
+        buffer = newBuf;
+        sessionBuffer = value.buffer;
+    }
+    if (buffer.length === 0) return new Response(null, {status: 200});
+    const isGrpc = buffer.length >= 6 && buffer[0] === 0 && buffer[5] === 0x0A;
+    const responseHeaders = new Headers(xhttpResponseHeaders);
+    if (isGrpc) {
+        responseHeaders.set('Content-Type', 'application/grpc');
+        responseHeaders.set('grpc-status', '0');
+    }
     return new Response(new ReadableStream({
         async start(controller) {
-            const writable = {send: (chunk) => controller.enqueue(chunk)}, close = () => {reader.releaseLock(), state.tcpSocket?.close(), controller.close()};
+            const writable = {send: (chunk) => controller.enqueue(isGrpc ? makeProtobufGrpcFrame(chunk) : chunk)};
+            const close = () => {reader.releaseLock(), state.tcpSocket?.close(), controller.close()};
+            let proxyPayloadBuf = new Uint8Array(0);
+            const processPayload = async (payload) => {
+                if (!payload || payload.length === 0) return;
+                if (state.tcpWriter) return state.tcpWriter(payload);
+                if (payload[0] === 0x05 || state.socks5State > 0) return await handleSession(payload, state, request, writable, close);
+                const combined = new Uint8Array(proxyPayloadBuf.length + payload.length);
+                combined.set(proxyPayloadBuf);
+                combined.set(payload, proxyPayloadBuf.length);
+                if (combined.length < 32) {
+                    proxyPayloadBuf = combined;
+                } else {
+                    proxyPayloadBuf = new Uint8Array(0);
+                    await handleSession(combined, state, request, writable, close);
+                }
+            };
+            let grpcBuf = new Uint8Array(0);
+            const processIncomingChunk = async (chunk) => {
+                if (isGrpc) {
+                    if (grpcBuf.byteLength > 0) {
+                        const combined = new Uint8Array(grpcBuf.byteLength + chunk.byteLength);
+                        combined.set(grpcBuf);
+                        combined.set(chunk, grpcBuf.byteLength);
+                        grpcBuf = combined;
+                    } else {grpcBuf = chunk}
+                    while (grpcBuf.byteLength >= 5) {
+                        const grpcLen = ((grpcBuf[1] << 24) >>> 0) | (grpcBuf[2] << 16) | (grpcBuf[3] << 8) | grpcBuf[4];
+                        if (grpcBuf.byteLength >= 5 + grpcLen) {
+                            const grpcData = grpcBuf.subarray(5, 5 + grpcLen);
+                            grpcBuf = grpcBuf.subarray(5 + grpcLen);
+                            await processPayload(stripProtobufHeader(grpcData));
+                        } else {break}
+                    }
+                } else {await processPayload(chunk)}
+            };
             try {
+                if (buffer.length > 0) await processIncomingChunk(buffer);
                 while (true) {
-                    let offset = 0, readLen = _maxChunkLen;
-                    !state.tcpWriter && (offset = used, readLen = 8192);
-                    const {done, value} = await reader.read(new Uint8Array(sessionBuffer, offset, readLen));
+                    let readLen = state.tcpWriter ? _maxChunkLen : 8192;
+                    const {done, value} = await reader.read(new Uint8Array(sessionBuffer, 0, readLen));
                     if (done) break;
                     sessionBuffer = value.buffer;
-                    if (state.tcpWriter) {
+                    if (!isGrpc && state.tcpWriter) {
                         state.tcpWriter(value.slice());
                         continue;
                     }
-                    if (new Uint8Array(sessionBuffer)[0] !== 5 && !state.socks5State) {
-                        used += value.byteLength;
-                        if (used < 32) continue;
-                        await handleSession(new Uint8Array(sessionBuffer, 0, used).slice(), state, request, writable, close);
-                    } else {await handleSession(value.slice(), state, request, writable, close)}
-                    used = 0;
+                    await processIncomingChunk(value.slice());
                 }
-            } catch {close()} finally {close()}
+            } finally {close()}
         },
         cancel() {state.tcpSocket?.close(), reader.releaseLock()}
-    }), {headers: xhttpResponseHeaders});
+    }), {headers: responseHeaders});
 };
 export default {
     async fetch(request) {
-        if (request.method === 'POST') return handleXhttp(request);
+        if (request.method === 'POST') return handlePost(request);
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
             webSocket.accept();
